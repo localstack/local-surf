@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "LocalSurf - Local AWS Redirector",
+  "version": "1.0",
+  "description": "LocalSurf - Redirect AWS API calls to LocalStack",
+
+  "action": {
+    "default_title": "LocalSurf - Local AWS Redirector",
+    "default_popup": "popup.html"
+  },
+
+  "permissions": [
+    "storage"
+  ],
+  "content_scripts": [
+    {
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "matches": [
+        "https://*/*",
+        "http://*/*"
+      ]
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["content.js"],
+      "matches": [
+        "https://*/*",
+        "http://*/*"
+      ]
+    }
+  ]
+}
