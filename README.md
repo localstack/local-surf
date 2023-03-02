@@ -2,6 +2,8 @@
 
 LocalSurf - a Chrome browser plugin to repoint AWS service calls to [LocalStack](https://localstack.cloud).
 
+⚠️ Please note that this plugin is experimental and still under active development.
+
 ## Background
 
 When developing and testing AWS cloud Web applications locally with LocalStack, we need to make the browser connect to the local endpoint (`http://localhost:4566`) instead of the AWS production servers (`*.amazonaws.com`).
