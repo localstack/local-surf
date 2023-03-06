@@ -12,6 +12,9 @@ const REQUESTS = {};
 const isExtensionContext = !!chrome.runtime;
 const isPageContext = !isExtensionContext;
 
+// constants
+const LOCALSTACK_HOST = "localhost.localstack.cloud:4566";
+
 /**
  * Patch XMLHttpRequest
  */
@@ -72,13 +75,14 @@ const patchXMLHttpRequest = () => {
         request.listeners[args[0]] = args;
     }
     XMLHttpRequest.prototype.open = function(...args) {
+        // TODO: clean up this function, make URL patterns configurable!
         const regex = /^https:\/\/(([a-z0-9-]+\.)+)amazonaws\.com:?[0-9]*\/.*/;
         const match = args[1].match(regex);
         if (args.length > 2 && match) {
             const path = _partition(_partition(args[1], "://")[1], "/")[1];
-            args[1] = `https://localhost.localstack.cloud:4566/${path}`;
+            args[1] = `https://${LOCALSTACK_HOST}/${path}`;
             if (match[1].match(/.*execute-api.*/)) {
-                args[1] = `https://${match[1]}localhost.localstack.cloud:4566/${path}`;
+                args[1] = `https://${match[1]}${LOCALSTACK_HOST}/${path}`;
             }
             const request = _getRequest(this);
             request._isLocalRequest = true;
@@ -89,16 +93,16 @@ const patchXMLHttpRequest = () => {
         const isRelPathProxyRequest = args[0] === "POST" && args[1].match(regex3);
         if (args.length > 2 && (args[1].match(regex2) || isRelPathProxyRequest)) {
             const path = isRelPathProxyRequest ? args[1] : _partition(_partition(args[1], "://")[1], "/")[1];
-            args[1] = `https://localhost.localstack.cloud:4566`;
+            args[1] = `https://${LOCALSTACK_HOST}`;
             const request = _getRequest(this);
             request._isLocalRequest = true;
             request._isRelPathRequest = !!isRelPathProxyRequest;
             var service = path.split("/")[path.split("/").length - 1];
             if (service === "statemachines") service = "stepfunctions";
             const newPath = path;
-            request._proxy_request = { service, path: newPath, open_args: args };
+            request._proxyRequest = { service, path: newPath, open_args: args };
             if (path === "/states/service/statemachines") {
-                request._proxy_request.headers = {
+                request._proxyRequest.headers = {
                     "x-amz-target": "AWSStepFunctions.ListStateMachines"
                 }
             }
@@ -116,8 +120,8 @@ const patchXMLHttpRequest = () => {
             _addListeners(this);
             return sendOrig.bind(this)(...args);
         }
-        if (request._proxy_request) {
-            const proxy_request = request._proxy_request;
+        if (request._proxyRequest) {
+            const proxy_request = request._proxyRequest;
             var params = proxy_request;
             if (!request._isRelPathRequest) {
                 var params = JSON.parse(args);
@@ -125,14 +129,15 @@ const patchXMLHttpRequest = () => {
             }
             if (!proxy_request.open_sent) {
                 proxy_request.open_args[0] = params.method || proxy_request.open_args[0];
-                proxy_request.open_args[1] = `https://localhost.localstack.cloud:4566${params.path || "/"}`;
+                proxy_request.open_args[1] = `https://${LOCALSTACK_HOST}${params.path || "/"}`;
                 forwardRequest("AJAX_OPEN", request.id, ...(proxy_request.open_args));
                 proxy_request.open_sent = true;
             }
             // set request headers
             Object.keys(params.headers || {}).forEach(key => this.setRequestHeader(key, params.headers[key]));
             // TODO: set proper date!
-            this.setRequestHeader("Authorization", `AWS4-HMAC-SHA256 Credential=test/20230129/${params.region}/${proxy_request.service}/aws4_request`);
+            const credential = `Credential=test/20230129/${params.region}/${proxy_request.service}/aws4_request`;
+            this.setRequestHeader("Authorization", `AWS4-HMAC-SHA256 ${credential}`);
         }
         forwardRequest("AJAX_SEND", request.id, ...args);
     }
@@ -150,6 +155,7 @@ const patchXMLHttpRequest = () => {
  * Patch the fetch(..) API to repoint *.amazonaws.com requests to localhost
  */
 const patchFetchAPI = () => {
+    // TODO: handle fetch requests also in content script, to prevent CSP errors
 
     const fetchOrig = fetch;
     window.fetch = async function(...args) {
@@ -157,7 +163,7 @@ const patchFetchAPI = () => {
         const isExcluded = args[0].match(/.*unifiedsearch\.amazonaws\.com.*/);
         if (args.length > 0 && !isExcluded && args[0].match(regex)) {
             const path = _partition(_partition(args[0], "://")[1], "/")[1];
-            args[0] = `https://localhost.localstack.cloud:4566/${path}`;
+            args[0] = `https://${LOCALSTACK_HOST}/${path}`;
         }
         return fetchOrig(...args);
     }
@@ -263,7 +269,7 @@ const injectScript = async (file_path, tag) => {
         item.innerHTML = node.childNodes[1].innerHTML;
         node.appendChild(item);
         item.querySelector('[title="Regions"]').innerHTML = "Local Mode";
-        item.querySelectorAll('svg')[1].parentElement.innerHTML = '<input type="checkbox" checked="true"/>';
+        item.querySelectorAll("svg")[1].parentElement.innerHTML = '<input type="checkbox" checked="true"/>';
     }
 }
 
@@ -273,9 +279,9 @@ if (isExtensionContext) {
     // inject the script into the page if we're executing in the content script context
     injectScript(chrome.runtime.getURL("content.js"), "html");
 }
+
 if (isPageContext) {
     console.log("Initializing LocalSurf extension, redirecting AWS service calls to LocalStack");
-
     // apply patches in the context of the page script
     patchXMLHttpRequest();
     patchFetchAPI();
