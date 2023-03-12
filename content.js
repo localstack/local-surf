@@ -12,8 +12,22 @@ const REQUESTS = {};
 const isExtensionContext = !!chrome.runtime;
 const isPageContext = !isExtensionContext;
 
-// constants
+// default target host
 const LOCALSTACK_HOST = "localhost.localstack.cloud:4566";
+
+// list of XHR proxy attributes - see https://developer.mozilla.org/en-US/docs/Web/API/XMLHttpRequest
+const XHR_PROXY_ATTRS = ["statusText", "responseType", "response", "responseText", "readyState", "responseXML", "responseURL", "status", "statusText", "withCredentials", "timeout"];
+// list of XHR event type names - see https://developer.mozilla.org/en-US/docs/Web/API/XMLHttpRequest#events
+const XHR_EVENT_NAMES = ["readystatechange", "progress", "error", "abort", "load", "beforesend", "loadstart", "loadend", "timeout"];
+// list of XHR event attributes - see https://developer.mozilla.org/en-US/docs/Web/API/Event
+const XHR_EVENT_ATTRS = [
+    // Event attributes
+    "isTrusted", "bubbles", "cancelBubble", "cancelable", "composed", "defaultPrevented",
+    "eventPhase", "path", "returnValue", "timeStamp", "type",
+    // ProgressEvent attributes
+    "lengthComputable", "loaded", "total",
+];
+
 
 /**
  * Patch XMLHttpRequest
@@ -21,8 +35,7 @@ const LOCALSTACK_HOST = "localhost.localstack.cloud:4566";
 const patchXMLHttpRequest = () => {
 
     // add all proxy getters, with fallback to _attribute
-    const attrs = ["statusText", "responseType", "response", "responseText", "readyState", "responseXML", "status", "upload"];
-    attrs.forEach(function(item) {
+    XHR_PROXY_ATTRS.forEach(function(item) {
         const oldProp = Object.getOwnPropertyDescriptor(window.XMLHttpRequest.prototype, item);
         Object.defineProperty(window.XMLHttpRequest.prototype, item, {
             get: function() {
@@ -42,6 +55,8 @@ const patchXMLHttpRequest = () => {
             }
         });
     });
+
+    // TODO: patch .getResponseHeader(...) !
 
     const openOrig = XMLHttpRequest.prototype.open;
     const sendOrig = XMLHttpRequest.prototype.send;
@@ -117,26 +132,26 @@ const patchXMLHttpRequest = () => {
     XMLHttpRequest.prototype.send = function(...args) {
         const request = _getRequest(this);
         if (request._isLocalRequest === false) {
-            _addListeners(this);
+            _addListeners(request);
             return sendOrig.bind(this)(...args);
         }
         if (request._proxyRequest) {
-            const proxy_request = request._proxyRequest;
-            var params = proxy_request;
+            const proxyRequest = request._proxyRequest;
+            var params = proxyRequest;
             if (!request._isRelPathRequest) {
                 var params = JSON.parse(args);
                 args = [params.contentString];
             }
-            if (!proxy_request.open_sent) {
-                proxy_request.open_args[0] = params.method || proxy_request.open_args[0];
-                proxy_request.open_args[1] = `https://${LOCALSTACK_HOST}${params.path || "/"}`;
-                forwardRequest("AJAX_OPEN", request.id, ...(proxy_request.open_args));
-                proxy_request.open_sent = true;
+            if (!proxyRequest.open_sent) {
+                proxyRequest.open_args[0] = params.method || proxyRequest.open_args[0];
+                proxyRequest.open_args[1] = `https://${LOCALSTACK_HOST}${params.path || "/"}`;
+                forwardRequest("AJAX_OPEN", request.id, ...(proxyRequest.open_args));
+                proxyRequest.open_sent = true;
             }
             // set request headers
             Object.keys(params.headers || {}).forEach(key => this.setRequestHeader(key, params.headers[key]));
             // TODO: set proper date!
-            const credential = `Credential=test/20230129/${params.region}/${proxy_request.service}/aws4_request`;
+            const credential = `Credential=test/20230129/${params.region}/${proxyRequest.service}/aws4_request`;
             this.setRequestHeader("Authorization", `AWS4-HMAC-SHA256 ${credential}`);
         }
         forwardRequest("AJAX_SEND", request.id, ...args);
@@ -144,7 +159,7 @@ const patchXMLHttpRequest = () => {
     XMLHttpRequest.prototype.setRequestHeader = function(...args) {
         const request = _getRequest(this);
         if (request._isLocalRequest === false) {
-            _addListeners(this);
+            _addListeners(request);
             return setRequestHeaderOrig.bind(this)(...args);
         }
         forwardRequest("AJAX_HEADER", request.id, ...args);
@@ -181,34 +196,40 @@ const handleEventMessage = (event) => {
 
     const select = (object, attrs) => attrs.reduce((obj, attr) => ({... obj, [attr]: object[attr]}), {});
 
-    if (isExtensionContext && event.data.type == "AJAX_OPEN") {
+    const getListener = (request, eventName) => {
+        const listeners = request.listeners || {};
+        if (listeners[eventName]) return listeners[eventName][1];
+        const listenerAttrName = `on${eventName.toLowerCase()}`;
+        const listenerFunc = request[listenerAttrName];
+        return listenerFunc;
+    };
+
+    if (isExtensionContext && event.data.type === "AJAX_OPEN") {
         const request = REQUESTS[event.data.id] = new XMLHttpRequest();
-        const events = ["readystatechange", "progress", "error", "abort", "load", "beforesend", "loadstart", "loadend", "timeout"];
-        events.forEach(eventName => {
+        XHR_EVENT_NAMES.forEach(eventName => {
             request.addEventListener(eventName, (...args) => {
-                const attributes = [
-                    "isTrusted", "bubbles", "cancelBubble", "cancelable", "composed", "defaultPrevented",
-                    "eventPhase", "lengthComputable", "loaded", "path", "returnValue", "timeStamp", "total", "type"
-                ];
                 var eventArgs = args;
                 if (args.length) {
-                    args[0] = select(args[0], attributes);
+                    args[0] = select(args[0], XHR_EVENT_ATTRS);
+                    delete args[0].currentTarget;
+                    delete args[0].srcElement;
+                    delete args[0].target;
                 }
-                const xhrState = select(request, ["readyState", "response", "responseType", "responseText", "status", "statusCode", "statusText"]);
+                const xhrState = select(request, XHR_PROXY_ATTRS);
                 xhrState["getAllResponseHeaders"] = request.getAllResponseHeaders();
                 forwardRequest("AJAX_STATE", event.data.id, {event: eventName, args: eventArgs, xhrState});
             });
         });
         request.open(... event.data.args);
-    } else if (isExtensionContext && event.data.type == "AJAX_SEND") {
+    } else if (isExtensionContext && event.data.type === "AJAX_SEND") {
         const request = REQUESTS[event.data.id];
         if (!request) return;
         request.send(... event.data.args);
-    } else if (isExtensionContext && event.data.type == "AJAX_HEADER") {
+    } else if (isExtensionContext && event.data.type === "AJAX_HEADER") {
         const request = REQUESTS[event.data.id];
         if (!request) return;
         request.setRequestHeader(... event.data.args);
-    } else if (isPageContext && event.data.type == "AJAX_STATE") {
+    } else if (isPageContext && event.data.type === "AJAX_STATE") {
         const request = REQUESTS[event.data.id];
         if (!request) return;
         const stateEvent = event.data.args[0];
@@ -223,13 +244,16 @@ const handleEventMessage = (event) => {
             });
         }
 
-        const listener = request.listeners && request.listeners[stateEvent.event];
-        if (!listener) return;
         Object.keys(stateEvent.xhrState).forEach(attr => {
             request[`_${attr}`] = stateEvent.xhrState[attr];
-            listener[1][attr] = stateEvent.xhrState[attr];
         });
-        listener[1](... stateEvent.args.slice(1));
+
+        const listener = getListener(request, stateEvent.event);
+        if (!listener) return;
+        Object.keys(stateEvent.xhrState).forEach(attr => {
+            listener[attr] = stateEvent.xhrState[attr];
+        });
+        listener(... stateEvent.args.slice(1));
     }
 };
 
