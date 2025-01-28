@@ -173,15 +173,19 @@ const patchFetchAPI = () => {
     // TODO: handle fetch requests also in content script, to prevent CSP errors
 
     const fetchOrig = fetch;
-    window.fetch = async function(...args) {
+    window.fetch = async function (...args) {
         const regex = /^https:\/\/([a-z0-9-]+\.)+amazonaws\.com:?\/.*/;
-        const isExcluded = args[0].match(/.*unifiedsearch\.amazonaws\.com.*/);
-        if (args.length > 0 && !isExcluded && args[0].match(regex)) {
-            const path = _partition(_partition(args[0], "://")[1], "/")[1];
-            args[0] = `https://${LOCALSTACK_HOST}/${path}`;
+        const href = args[0].constructor == URL ? args[0].href : args[0];
+        const isExcluded = href.match(/.*unifiedsearch\.amazonaws\.com.*/);
+        if (args.length > 0 && !isExcluded && href.match(regex)) {
+            const path = _partition(_partition(href, '://')[1], '/')[1];
+            args[0] =
+                args[0].constructor == URL
+                    ? new URL(`https://${LOCALSTACK_HOST}/${path}`)
+                    : `https://${LOCALSTACK_HOST}/${path}`;
         }
         return fetchOrig(...args);
-    }
+    };
 }
 
 
