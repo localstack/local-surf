@@ -7,6 +7,8 @@
 
 // keeping track of AJAX requests (XMLHttpRequest) made by the browser
 const REQUESTS = {};
+// keep track of Fetch API request responses - TODO find a better mechanism for this
+const RESPONSES = {};
 
 // determine whether we are in the context of the page script or the content script
 const isExtensionContext = !!chrome.runtime;
@@ -27,6 +29,10 @@ const XHR_EVENT_ATTRS = [
     // ProgressEvent attributes
     "lengthComputable", "loaded", "total",
 ];
+
+// list of services that are unsupported in LocalStack, and hence should not be proxied - TODO update over time
+const UNSUPPORTED_SERVICES = ["console-control"];
+
 
 
 /**
@@ -62,12 +68,6 @@ const patchXMLHttpRequest = () => {
     const sendOrig = XMLHttpRequest.prototype.send;
     const addEventListenerOrig = XMLHttpRequest.prototype.addEventListener;
     const setRequestHeaderOrig = XMLHttpRequest.prototype.setRequestHeader;
-
-    const _getRequest = (xhrObj) => {
-        xhrObj.id = xhrObj.id || String(Math.random());
-        REQUESTS[xhrObj.id] = xhrObj;
-        return xhrObj;
-    };
 
     const _addListeners = (request) => {
         if (request._listenersAdded) return;
@@ -170,17 +170,46 @@ const patchXMLHttpRequest = () => {
  * Patch the fetch(..) API to repoint *.amazonaws.com requests to localhost
  */
 const patchFetchAPI = () => {
-    // TODO: handle fetch requests also in content script, to prevent CSP errors
-
     const fetchOrig = fetch;
     window.fetch = async function(...args) {
+        const request = _getRequest(args[0]);
+        const isRequestObj = !!args[0].url;
         const regex = /^https:\/\/([a-z0-9-]+\.)+amazonaws\.com:?\/.*/;
-        const isExcluded = args[0].match(/.*unifiedsearch\.amazonaws\.com.*/);
-        if (args.length > 0 && !isExcluded && args[0].match(regex)) {
-            const path = _partition(_partition(args[0], "://")[1], "/")[1];
-            args[0] = `https://${LOCALSTACK_HOST}/${path}`;
+        const url = isRequestObj ? args[0].url : args[0];
+        if (!url.match(regex)) {
+            return fetchOrig(...args);
         }
-        return fetchOrig(...args);
+        if (isRequestObj) {
+            const authHeader = args[0].headers.get("authorization") || "";
+            const shouldSkip = UNSUPPORTED_SERVICES.filter(service => authHeader.includes(`/${service}/`));
+            if (shouldSkip.length) {
+                return fetchOrig(...args);
+            }
+        }
+
+        // adjust path and construct updated request URL
+        const path = _partition(_partition(url, "://")[1], "/")[1];
+        const newUrl = `https://${LOCALSTACK_HOST}/${path}`;
+        args[0] = isRequestObj ? new Request(newUrl, args[0]) : newUrl;
+        if (isRequestObj) {
+            const keys = ["url", "headers", "method", "body", "id", "mode", "redirect", "referrer", "integrity"];
+            args[0] = _objectToMap(args[0], keys);
+            if (args[0].headers) {
+                args[0].headers = _headersToMap(args[0].headers);
+            }
+            args[0].body = await new Response(args[0].body).text();
+        }
+
+        // forward request to backend content script, then poll for the result and return the response
+        forwardRequest("FETCH_REQ", request.id, ...args);
+        const getResult = () => {
+            const result = RESPONSES[request.id];
+            if (!result) throw Error();
+            return result.args[0];
+        };
+        const result = await retry(getResult, 10, 300);
+        const response = new Response(result.body, result);
+        return response;
     }
 }
 
@@ -189,7 +218,7 @@ const patchFetchAPI = () => {
  * Handler function to handle event messages exchanged between
  * the page script and the content script.
  */
-const handleEventMessage = (event) => {
+const handleEventMessage = async (event) => {
 
     // We only accept messages from ourselves
     if (event.source != window) return;
@@ -216,7 +245,7 @@ const handleEventMessage = (event) => {
                     delete args[0].target;
                 }
                 const xhrState = select(request, XHR_PROXY_ATTRS);
-                xhrState["getAllResponseHeaders"] = request.getAllResponseHeaders();
+                xhrState.getAllResponseHeaders = request.getAllResponseHeaders();
                 forwardRequest("AJAX_STATE", event.data.id, {event: eventName, args: eventArgs, xhrState});
             });
         });
@@ -229,6 +258,14 @@ const handleEventMessage = (event) => {
         const request = REQUESTS[event.data.id];
         if (!request) return;
         request.setRequestHeader(... event.data.args);
+    } else if (isExtensionContext && event.data.type === "FETCH_REQ") {
+        const args = event.data.args;
+        if (args[0].url) args[0] = new Request(args[0].url, args[0]);
+        const response = await window.fetch(... event.data.args);
+        const result = _objectToMap(response, ["url", "ok", "status", "headers", "type"]);
+        result.headers = _headersToMap(result.headers);
+        result.body = await response.text();
+        forwardRequest("FETCH_RES", event.data.id, result);
     } else if (isPageContext && event.data.type === "AJAX_STATE") {
         const request = REQUESTS[event.data.id];
         if (!request) return;
@@ -254,6 +291,8 @@ const handleEventMessage = (event) => {
             listener[attr] = stateEvent.xhrState[attr];
         });
         listener(... stateEvent.args.slice(1));
+    } else if (isPageContext && event.data.type === "FETCH_RES") {
+        RESPONSES[event.data.id] = event.data;
     }
 };
 
@@ -265,6 +304,47 @@ const _partition = (str, delimiter) => {
     const p2 = str.substr(index + delimiter.length);
     return [p1, p2];
 };
+
+const _getRequest = (obj) => {
+    obj.id = obj.id || String(Math.random());
+    REQUESTS[obj.id] = obj;
+    return obj;
+};
+
+const _headersToMap = (headers) => {
+    const result = {};
+    for (const pair of headers.entries()) {
+        result[pair[0]] = pair[1];
+    }
+    return result;
+};
+
+const _objectToMap = (obj, keys) => {
+    const out = {};
+    for (const key in obj) {
+        if (keys && !keys.includes(key)) continue;
+        out[key] = obj[key];
+    }
+    return out;
+}
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+const timeout = (p, ms) => Promise.race([ p, sleep(ms).then(_ => { throw Error("timeout") }) ]);
+
+const retry = async (fn, attempts, wait = 1000) => {
+  let count = 0;
+  while (count++ < attempts) {
+     try {
+        return await fn();
+     } catch(e) {
+       if (count >= attempts) {
+          throw e;
+       }
+       await sleep(wait);
+     }
+  }
+}
 
 const forwardRequest = (type, id, ...args) => {
     const location = window.location;
