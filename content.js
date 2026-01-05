@@ -31,8 +31,7 @@ const XHR_EVENT_ATTRS = [
 ];
 
 // list of services that are unsupported in LocalStack, and hence should not be proxied - TODO update over time
-const UNSUPPORTED_SERVICES = ["console-control"];
-
+const UNSUPPORTED_SERVICES = ["console-control", "control"];
 
 
 /**
@@ -76,7 +75,13 @@ const patchXMLHttpRequest = () => {
             request.addEventListener(args[0], ... args.slice(1));
         });
         request._listenersAdded = true;
-    }
+    };
+    const _runOriginalRequest = (req, args) => {
+        const request = REQUESTS[req.id] || this;
+        request._isLocalRequest = false;
+        _addListeners(request);
+        return openOrig.bind(req)(...args);
+    };
 
     XMLHttpRequest.prototype.addEventListener = function(...args) {
         const request = _getRequest(this);
@@ -92,9 +97,14 @@ const patchXMLHttpRequest = () => {
     XMLHttpRequest.prototype.open = function(...args) {
         // TODO: clean up this function, make URL patterns configurable!
         const regex = /^https:\/\/(([a-z0-9-]+\.)+)amazonaws\.com:?[0-9]*\/.*/;
-        const match = args[1].match(regex);
+        const url = args[1];
+        const match = url.match(regex);
+        if (url.includes('amazon') && url.includes('/control/')) {
+            // fall back to regular request
+            return _runOriginalRequest(this, args);
+        }
         if (args.length > 2 && match) {
-            const path = _partition(_partition(args[1], "://")[1], "/")[1];
+            const path = _partition(_partition(url, "://")[1], "/")[1];
             args[1] = `https://${LOCALSTACK_HOST}/${path}`;
             if (match[1].match(/.*execute-api.*/)) {
                 args[1] = `https://${match[1]}${LOCALSTACK_HOST}/${path}`;
@@ -105,9 +115,9 @@ const patchXMLHttpRequest = () => {
         }
         const regex2 = /^https:\/\/([a-z0-9-]+\.)+aws\.amazon\.com:?\/(?!api\/).*/;
         const regex3 = /^\/states\/.*/;
-        const isRelPathProxyRequest = args[0] === "POST" && args[1].match(regex3);
-        if (args.length > 2 && (args[1].match(regex2) || isRelPathProxyRequest)) {
-            const path = isRelPathProxyRequest ? args[1] : _partition(_partition(args[1], "://")[1], "/")[1];
+        const isRelPathProxyRequest = args[0] === "POST" && url.match(regex3);
+        if (args.length > 2 && (url.match(regex2) || isRelPathProxyRequest)) {
+            const path = isRelPathProxyRequest ? url : _partition(_partition(url, "://")[1], "/")[1];
             args[1] = `https://${LOCALSTACK_HOST}`;
             const request = _getRequest(this);
             request._isLocalRequest = true;
@@ -124,10 +134,7 @@ const patchXMLHttpRequest = () => {
             return;
         }
         // fall back to regular request
-        const request = REQUESTS[this.id] || this;
-        request._isLocalRequest = false;
-        _addListeners(request);
-        return openOrig.bind(this)(...args);
+        return _runOriginalRequest(this, args);
     }
     XMLHttpRequest.prototype.send = function(...args) {
         const request = _getRequest(this);
@@ -138,6 +145,9 @@ const patchXMLHttpRequest = () => {
         if (request._proxyRequest) {
             const proxyRequest = request._proxyRequest;
             var params = proxyRequest;
+            if (!params.region) {
+                return sendOrig.bind(this)(...args);
+            }
             if (!request._isRelPathRequest) {
                 var params = JSON.parse(args);
                 args = [params.contentString];
